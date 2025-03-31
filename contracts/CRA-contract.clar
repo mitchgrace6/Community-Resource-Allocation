@@ -58,6 +58,8 @@
 (define-data-var next-vote-id uint u1)
 (define-data-var next-request-id uint u1)
 
+
+
 ;; Mapping for communities
 (define-map communities
   { community-id: uint }
@@ -81,17 +83,169 @@
   { added-at: uint }
 )
 
-;; CRA-contract
-;; <add a description here>
+;; Mapping for resources
+(define-map resources
+  { resource-id: uint }
+  {
+    community-id: uint,
+    name: (string-utf8 100),
+    description: (string-utf8 500),
+    resource-type: uint,
+    total-supply: uint,           ;; Total available units/slots
+    remaining-supply: uint,       ;; Currently available units/slots
+    minimum-contribution: uint,   ;; Contribution required to access
+    max-per-allocation: uint,     ;; Maximum units per allocation
+    cooldown-period: uint,        ;; Blocks between allocations
+    is-active: bool,
+    created-at: uint,
+    updated-at: uint
+  }
+)
 
-;; constants
-;;
+;; Mapping for community members
+(define-map members
+  { community-id: uint, member-id: uint }
+  {
+    principal: principal,
+    contribution: uint,
+    join-block: uint,
+    last-contribution-block: uint,
+    allocation-count: uint,
+    reputation-score: uint,       ;; 0-100 score
+    is-active: bool,
+    roles: (list 5 (string-utf8 50))
+  }
+)
 
-;; data maps and vars
-;;
+;; Mapping for principal to member ID
+(define-map principals-to-members
+  { community-id: uint, principal: principal }
+  { member-id: uint }
+)
 
-;; private functions
-;;
+;; Mapping for resource allocations
+(define-map allocations
+  { allocation-id: uint }
+  {
+    resource-id: uint,
+    community-id: uint,
+    member-id: uint,
+    amount: uint,               ;; Units or time slots
+    start-block: uint,
+    end-block: (optional uint), ;; For time-based resources
+    status: uint,
+    created-at: uint,
+    updated-at: uint,
+    notes: (string-utf8 200)
+  }
+)
 
-;; public functions
-;;
+;; Mapping for allocation requests
+(define-map allocation-requests
+  { request-id: uint }
+  {
+    resource-id: uint,
+    community-id: uint,
+    member-id: uint,
+    amount: uint,
+    requested-start: uint,
+    requested-duration: (optional uint), ;; For time-based resources
+    justification: (string-utf8 500),
+    created-at: uint,
+    status: uint,
+    votes-for: uint,
+    votes-against: uint
+  }
+)
+
+;; Mapping for resource usage history
+(define-map resource-usage
+  { resource-id: uint, member-id: uint }
+  {
+    total-usage: uint,
+    last-usage-block: uint,
+    usage-count: uint,
+    average-duration: uint,      ;; For time-based resources
+    contribution-at-last-usage: uint
+  }
+)
+
+;; Mapping for resource disputes
+(define-map disputes
+  { dispute-id: uint }
+  {
+    community-id: uint,
+    resource-id: uint,
+    allocation-id: (optional uint),
+    raised-by: uint,             ;; member-id
+    raised-against: (optional uint), ;; member-id (if applicable)
+    dispute-type: (string-utf8 50),  ;; "overuse", "misuse", "fairness", etc.
+    description: (string-utf8 500),
+    status: uint,
+    created-at: uint,
+    resolution: (optional (string-utf8 500)),
+    votes-for: uint,
+    votes-against: uint,
+    resolved-at: (optional uint)
+  }
+)
+
+;; Mapping for dispute votes
+(define-map dispute-votes
+  { dispute-id: uint, member-id: uint }
+  {
+    vote: bool,                  ;; true = for, false = against
+    justification: (string-utf8 200),
+    weight: uint,                ;; Based on contribution/reputation
+    vote-time: uint
+  }
+)
+
+;; Mapping for resource expansion proposals
+(define-map expansion-proposals
+  { expansion-id: uint }
+  {
+    community-id: uint,
+    resource-id: (optional uint), ;; If expanding existing resource
+    name: (string-utf8 100),
+    description: (string-utf8 500),
+    proposed-by: uint,            ;; member-id
+    resource-type: uint,
+    proposed-supply: uint,
+    estimated-cost: uint,
+    funding-source: (string-utf8 100),
+    status: uint,
+    votes-for: uint,
+    votes-against: uint,
+    created-at: uint,
+    voting-ends-at: uint,
+    implemented-at: (optional uint)
+  }
+)
+
+;; Mapping for expansion votes
+(define-map expansion-votes
+  { expansion-id: uint, member-id: uint }
+  {
+    vote: bool,                  ;; true = for, false = against
+    weight: uint,                ;; Based on contribution/reputation
+    vote-time: uint
+  }
+)
+
+;; Read-only functions
+
+;; Get community details
+(define-read-only (get-community (community-id uint))
+  (map-get? communities { community-id: community-id })
+)
+
+;; Get resource details
+(define-read-only (get-resource (resource-id uint))
+  (map-get? resources { resource-id: resource-id })
+)
+
+;; Get member details
+(define-read-only (get-member (community-id uint) (member-id uint))
+  (map-get? members { community-id: community-id, member-id: member-id })
+)
