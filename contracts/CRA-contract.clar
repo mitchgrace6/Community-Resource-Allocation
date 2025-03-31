@@ -687,3 +687,267 @@
     (ok true)
   )
 )
+;; Propose a resource expansion
+(define-public (propose-expansion
+  (community-id uint)
+  (resource-id (optional uint))
+  (name (string-utf8 100))
+  (description (string-utf8 500))
+  (resource-type uint)
+  (proposed-supply uint)
+  (estimated-cost uint)
+  (funding-source (string-utf8 100))
+)
+  (let
+    (
+      (expansion-id (var-get next-expansion-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; If expanding existing resource, check if it exists
+    (when (is-some resource-id)
+      (let
+        (
+          (resource (unwrap! (get-resource (unwrap-panic resource-id)) (err ERR-RESOURCE-NOT-FOUND)))
+        )
+        ;; Check if resource belongs to community
+        (asserts! (is-eq (get community-id resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+      )
+    )
+    
+    ;; Create expansion proposal
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      {
+        community-id: community-id,
+        resource-id: resource-id,
+        name: name,
+        description: description,
+        proposed-by: member-id,
+        resource-type: resource-type,
+        proposed-supply: proposed-supply,
+        estimated-cost: estimated-cost,
+        funding-source: funding-source,
+        status: EXPANSION-STATUS-PROPOSAL,
+        votes-for: u0,
+        votes-against: u0,
+        created-at: block-height,
+        voting-ends-at: (+ block-height u1440), ;; ~10 days (assuming 1 block/min)
+        implemented-at: none
+      }
+    )
+    
+    ;; Increment expansion ID
+    (var-set next-expansion-id (+ expansion-id u1))
+    
+    (ok expansion-id)
+  )
+)
+
+;; Start voting on expansion proposal
+(define-public (start-expansion-voting (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if proposal is in proposal state
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-PROPOSAL) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update status to voting
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        status: EXPANSION-STATUS-VOTING,
+        voting-ends-at: (+ block-height u1440) ;; ~10 days from now
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Vote on expansion proposal
+(define-public (vote-on-expansion (expansion-id uint) (vote bool))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (vote-weight (calculate-vote-weight community-id member-id))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if expansion is in voting phase
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-VOTING) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if voting period hasn't ended
+    (asserts! (<= block-height (get voting-ends-at expansion)) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if member hasn't already voted
+    (asserts! (is-none (map-get? expansion-votes { expansion-id: expansion-id, member-id: member-id })) (err ERR-VOTE-ALREADY-CAST))
+    
+    ;; Record vote
+    (map-set expansion-votes
+      { expansion-id: expansion-id, member-id: member-id }
+      {
+        vote: vote,
+        weight: vote-weight,
+        vote-time: block-height
+      }
+    )
+    
+    ;; Update vote tally
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        votes-for: (if vote 
+                     (+ (get votes-for expansion) vote-weight)
+                     (get votes-for expansion)),
+        votes-against: (if vote 
+                         (get votes-against expansion)
+                         (+ (get votes-against expansion) vote-weight))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Finalize expansion proposal voting
+(define-public (finalize-expansion-voting (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if expansion is in voting phase
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-VOTING) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Check if voting period has ended
+    (asserts! (> block-height (get voting-ends-at expansion)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Determine outcome
+    (let
+      (
+        (total-votes (+ (get votes-for expansion) (get votes-against expansion)))
+        (result (if (> (get votes-for expansion) (get votes-against expansion))
+                  EXPANSION-STATUS-APPROVED
+                  EXPANSION-STATUS-DENIED))
+      )
+      
+      ;; Update expansion status
+      (map-set expansion-proposals
+        { expansion-id: expansion-id }
+        (merge expansion {
+          status: result
+        })
+      )
+      
+      (ok result)
+    )
+  )
+)
+
+;; Implement approved expansion
+(define-public (implement-expansion (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if expansion is approved
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-APPROVED) (err ERR-INVALID-PARAMETERS))
+    
+    ;; If expanding existing resource
+    (match (get resource-id expansion)
+      existing-resource-id
+      (let
+        (
+          (resource (unwrap! (get-resource existing-resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+        )
+        ;; Update resource
+        (map-set resources
+          { resource-id: existing-resource-id }
+          (merge resource {
+            total-supply: (+ (get total-supply resource) (get proposed-supply expansion)),
+            remaining-supply: (+ (get remaining-supply resource) (get proposed-supply expansion)),
+            updated-at: block-height
+          })
+        )
+      )
+      ;; Creating new resource
+      (let
+        (
+          (resource-id (var-get next-resource-id))
+          (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+        )
+        ;; Create new resource
+        (map-set resources
+          { resource-id: resource-id }
+          {
+            community-id: community-id,
+            name: (get name expansion),
+            description: (get description expansion),
+            resource-type: (get resource-type expansion),
+            total-supply: (get proposed-supply expansion),
+            remaining-supply: (get proposed-supply expansion),
+            minimum-contribution: u0, ;; Default, should be set by admin later
+            max-per-allocation: (get proposed-supply expansion), ;; Default, should be set by admin later
+            cooldown-period: u0, ;; Default, should be set by admin later
+            is-active: true,
+            created-at: block-height,
+            updated-at: block-height
+          }
+        )
+        
+        ;; Update community resource count
+        (map-set communities
+          { community-id: community-id }
+          (merge community {
+            resource-count: (+ (get resource-count community) u1)
+          })
+        )
+        
+        ;; Increment resource ID
+        (var-set next-resource-id (+ resource-id u1))
+      )
+    )
+    
+    ;; Update expansion status
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        status: EXPANSION-STATUS-IMPLEMENTED,
+        implemented-at: (some block-height)
+      })
+    )
+    
+    (ok true)
+  )
+)
