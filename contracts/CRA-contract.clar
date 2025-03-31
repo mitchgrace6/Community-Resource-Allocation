@@ -498,3 +498,192 @@
         roles: (list "member")
       }
     )
+     ;; Map principal to member ID
+    (map-set principals-to-members
+      { community-id: community-id, principal: tx-sender }
+      { member-id: member-id }
+    )
+    
+    ;; Update community stats
+    (map-set communities
+      { community-id: community-id }
+      (merge community {
+        active-member-count: (+ (get active-member-count community) u1),
+        total-contribution: (+ (get total-contribution community) initial-contribution)
+      })
+    )
+    
+    ;; Increment member ID
+    (var-set next-member-id (+ member-id u1))
+    
+    (ok member-id)
+  )
+)
+
+;; Make a contribution
+(define-public (contribute (community-id uint) (amount uint))
+  (let
+    (
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Update member contribution
+    (map-set members
+      { community-id: community-id, member-id: member-id }
+      (merge member {
+        contribution: (+ (get contribution member) amount),
+        last-contribution-block: block-height
+      })
+    )
+    
+    ;; Update community total contribution
+    (map-set communities
+      { community-id: community-id }
+      (merge community {
+        total-contribution: (+ (get total-contribution community) amount)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Request resource allocation
+(define-public (request-allocation
+  (community-id uint)
+  (resource-id uint)
+  (amount uint)
+  (requested-start uint)
+  (requested-duration (optional uint))
+  (justification (string-utf8 500))
+)
+  (let
+    (
+      (request-id (var-get next-request-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if resource belongs to community
+    (asserts! (is-eq (get community-id resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Create dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      {
+        community-id: community-id,
+        resource-id: resource-id,
+        allocation-id: allocation-id,
+        raised-by: member-id,
+        raised-against: against-member-id,
+        dispute-type: dispute-type,
+        description: description,
+        status: DISPUTE-STATUS-OPEN,
+        created-at: block-height,
+        resolution: none,
+        votes-for: u0,
+        votes-against: u0,
+        resolved-at: none
+      }
+    )
+    
+    ;; Increment dispute ID
+    (var-set next-dispute-id (+ dispute-id u1))
+    
+    (ok dispute-id)
+  )
+)
+
+;; Vote on a dispute
+(define-public (vote-on-dispute (dispute-id uint) (vote bool) (justification (string-utf8 200)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err ERR-DISPUTE-NOT-FOUND)))
+      (community-id (get community-id dispute))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (vote-weight (calculate-vote-weight community-id member-id))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if dispute is open for voting
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-VOTING) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if member hasn't already voted
+    (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, member-id: member-id })) (err ERR-VOTE-ALREADY-CAST))
+    
+    ;; Record vote
+    (map-set dispute-votes
+      { dispute-id: dispute-id, member-id: member-id }
+      {
+        vote: vote,
+        justification: justification,
+        weight: vote-weight,
+        vote-time: block-height
+      }
+    )
+    
+    ;; Update vote tally
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        votes-for: (if vote 
+                     (+ (get votes-for dispute) vote-weight)
+                     (get votes-for dispute)),
+        votes-against: (if vote 
+                         (get votes-against dispute)
+                         (+ (get votes-against dispute) vote-weight))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a dispute
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-utf8 500)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err ERR-DISPUTE-NOT-FOUND)))
+      (community-id (get community-id dispute))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if dispute is still open or in voting
+    (asserts! (or (is-eq (get status dispute) DISPUTE-STATUS-OPEN)
+                 (is-eq (get status dispute) DISPUTE-STATUS-VOTING))
+              (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: DISPUTE-STATUS-RESOLVED,
+        resolution: (some resolution),
+        resolved-at: (some block-height)
+      })
+    )
+    
+    ;; Apply penalties or adjustments based on resolution
+    ;; This would be more complex in a full implementation
+    
+    (ok true)
+  )
+)
