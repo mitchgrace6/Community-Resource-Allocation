@@ -951,3 +951,316 @@
     (ok true)
   )
 )
+;; Make admin
+(define-public (make-admin (community-id uint) (user-principal principal))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if user is a member
+    (asserts! (is-some (get-member-id community-id user-principal)) (err ERR-MEMBER-NOT-FOUND))
+    
+    ;; Add user as admin
+    (map-set community-admins
+      { community-id: community-id, admin-principal: user-principal }
+      { added-at: block-height }
+    )
+    
+    ;; Update member roles
+    (match (get-member-id community-id user-principal)
+      member-mapping
+      (let
+        (
+          (member-id (get member-id member-mapping))
+          (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+          (current-roles (get roles member))
+        )
+        (map-set members
+          { community-id: community-id, member-id: member-id }
+          (merge member {
+            roles: (append current-roles "admin")
+          })
+        )
+      )
+      (err ERR-MEMBER-NOT-FOUND)
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update member reputation
+(define-public (update-reputation (community-id uint) (member-id uint) (score-change int))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Calculate new reputation score (bounded 0-100)
+    (let
+      (
+        (current-score (get reputation-score member))
+        (new-score (+ current-score score-change))
+        (bounded-score (max (min new-score u100) u0))
+      )
+      
+      ;; Update member
+      (map-set members
+        { community-id: community-id, member-id: member-id }
+        (merge member {
+          reputation-score: bounded-score
+        })
+      )
+      
+      (ok bounded-score)
+    )
+  )
+)
+d resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if resource is active
+    (asserts! (get is-active resource) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if sufficient contribution
+    (asserts! (>= (get contribution member) (get minimum-contribution resource)) (err ERR-INSUFFICIENT-CONTRIBUTION))
+    
+    ;; Check if resource has sufficient supply
+    (asserts! (>= (get remaining-supply resource) amount) (err ERR-RESOURCE-DEPLETED))
+    
+    ;; Create allocation request
+    (map-set allocation-requests
+      { request-id: request-id }
+      {
+        resource-id: resource-id,
+        community-id: community-id,
+        member-id: member-id,
+        amount: amount,
+        requested-start: requested-start,
+        requested-duration: requested-duration,
+        justification: justification,
+        created-at: block-height,
+        status: ALLOCATION-STATUS-PENDING,
+        votes-for: u0,
+        votes-against: u0
+      }
+    )
+    
+    ;; Increment request ID
+    (var-set next-request-id (+ request-id u1))
+    
+    (ok request-id)
+  )
+)
+
+;; Process allocation request (auto-approval based on entitlement)
+(define-public (process-allocation-request (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? allocation-requests { request-id: request-id }) (err ERR-REQUEST-NOT-FOUND)))
+      (resource-id (get resource-id request))
+      (community-id (get community-id request))
+      (member-id (get member-id request))
+      (amount (get amount request))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+      (entitlement (calculate-allocation-entitlement community-id resource-id member-id))
+      (allocation-id (var-get next-allocation-id))
+    )
+    
+    ;; Check if requester or admin
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+        (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+      )
+      (err ERR-NOT-AUTHORIZED)
+    )
+    
+    ;; Check if request is pending
+    (asserts! (is-eq (get status request) ALLOCATION-STATUS-PENDING) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Check entitlement
+    (asserts! (<= amount (get max-allocation entitlement)) (err ERR-ALLOCATION-LIMIT-REACHED))
+    
+    ;; Check current supply
+    (asserts! (>= (get remaining-supply resource) amount) (err ERR-RESOURCE-DEPLETED))
+    
+    ;; Create allocation
+    (map-set allocations
+      { allocation-id: allocation-id }
+      {
+        resource-id: resource-id,
+        community-id: community-id,
+        member-id: member-id,
+        amount: amount,
+        start-block: (get requested-start request),
+        end-block: (match (get requested-duration request)
+                    duration (some (+ (get requested-start request) duration))
+                    none),
+        status: ALLOCATION-STATUS-APPROVED,
+        created-at: block-height,
+        updated-at: block-height,
+        notes: "Auto-approved based on contribution entitlement"
+      }
+    )
+    
+    ;; Update resource remaining supply
+    (map-set resources
+      { resource-id: resource-id }
+      (merge resource {
+        remaining-supply: (- (get remaining-supply resource) amount),
+        updated-at: block-height
+      })
+    )
+    
+    ;; Update request status
+    (map-set allocation-requests
+      { request-id: request-id }
+      (merge request {
+        status: ALLOCATION-STATUS-APPROVED
+      })
+    )
+    
+    ;; Update member allocation count
+    (match (get-member community-id member-id)
+      member
+      (map-set members
+        { community-id: community-id, member-id: member-id }
+        (merge member {
+          allocation-count: (+ (get allocation-count member) u1)
+        })
+      )
+      (err ERR-MEMBER-NOT-FOUND)
+    )
+    
+    ;; Update usage tracking
+    (match (map-get? resource-usage { resource-id: resource-id, member-id: member-id })
+      usage
+      (map-set resource-usage
+        { resource-id: resource-id, member-id: member-id }
+        {
+          total-usage: (+ (get total-usage usage) amount),
+          last-usage-block: block-height,
+          usage-count: (+ (get usage-count usage) u1),
+          average-duration: (match (get requested-duration request)
+                            duration 
+                            (/ (+ (* (get average-duration usage) (get usage-count usage)) duration)
+                               (+ (get usage-count usage) u1))
+                            (get average-duration usage)),
+          contribution-at-last-usage: (get contribution (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+        }
+      )
+      ;; First usage
+      (map-set resource-usage
+        { resource-id: resource-id, member-id: member-id }
+        {
+          total-usage: amount,
+          last-usage-block: block-height,
+          usage-count: u1,
+          average-duration: (default-to u0 (get requested-duration request)),
+          contribution-at-last-usage: (get contribution (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+        }
+      )
+    )
+    
+    ;; Increment allocation ID
+    (var-set next-allocation-id (+ allocation-id u1))
+    
+    (ok allocation-id)
+  )
+)
+
+;; Complete a resource allocation (release the resource)
+(define-public (complete-allocation (allocation-id uint))
+  (let
+    (
+      (allocation (unwrap! (map-get? allocations { allocation-id: allocation-id }) (err ERR-ALLOCATION-NOT-FOUND)))
+      (resource-id (get resource-id allocation))
+      (community-id (get community-id allocation))
+      (member-id (get member-id allocation))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
+    ;; Check if requester or admin
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+        (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+      )
+      (err ERR-NOT-AUTHORIZED)
+    )
+    
+    ;; Check if allocation is approved
+    (asserts! (is-eq (get status allocation) ALLOCATION-STATUS-APPROVED) (err ERR-INVALID-PARAMETERS))
+    
+    ;; For time-based resources, check if end time has passed
+    (match (get end-block allocation)
+      end-time
+      (when (> end-time block-height) 
+        ;; If still in use, allow early return only for the user themselves or admin
+        (asserts! 
+          (or 
+            (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+            (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+          )
+          (err ERR-NOT-AUTHORIZED)
+        ))
+      true
+    )
+    
+    ;; Update allocation status
+    (map-set allocations
+      { allocation-id: allocation-id }
+      (merge allocation {
+        status: ALLOCATION-STATUS-COMPLETED,
+        updated-at: block-height
+      })
+    )
+    
+    ;; For unique or time-based resources, return the resource to the pool
+    (when (or (is-eq (get resource-type resource) RESOURCE-TYPE-UNIQUE)
+             (is-eq (get resource-type resource) RESOURCE-TYPE-TIME-BASED))
+      (map-set resources
+        { resource-id: resource-id }
+        (merge resource {
+          remaining-supply: (+ (get remaining-supply resource) (get amount allocation)),
+          updated-at: block-height
+        })
+      )
+    )
+    
+    ;; For consumable resources, don't return to pool
+    
+    (ok true)
+  )
+)
+
+;; Raise a dispute over resource usage
+(define-public (raise-dispute
+  (community-id uint)
+  (resource-id uint)
+  (allocation-id (optional uint))
+  (against-member-id (optional uint))
+  (dispute-type (string-utf8 50))
+  (description (string-utf8 500))
+)
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
+    ;; Check if resource belongs to community
+    (asserts! (is-eq (get community-i
