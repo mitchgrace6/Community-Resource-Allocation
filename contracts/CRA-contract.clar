@@ -249,3 +249,143 @@
 (define-read-only (get-member (community-id uint) (member-id uint))
   (map-get? members { community-id: community-id, member-id: member-id })
 )
+;; Get member ID from principal
+(define-read-only (get-member-id (community-id uint) (user-principal principal))
+  (map-get? principals-to-members { community-id: community-id, principal: user-principal })
+)
+
+;; Get allocation details
+(define-read-only (get-allocation (allocation-id uint))
+  (map-get? allocations { allocation-id: allocation-id })
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+;; Get expansion proposal details
+(define-read-only (get-expansion-proposal (expansion-id uint))
+  (map-get? expansion-proposals { expansion-id: expansion-id })
+)
+
+;; Calculate member's allocation entitlement based on contribution
+(define-read-only (calculate-allocation-entitlement (community-id uint) (resource-id uint) (member-id uint))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (tuple (max-allocation u0))))
+      (resource (unwrap! (get-resource resource-id) (tuple (max-allocation u0))))
+      (member (unwrap! (get-member community-id member-id) (tuple (max-allocation u0))))
+    )
+    
+    (if (< (get contribution member) (get minimum-contribution resource))
+      ;; Not enough contribution
+      (tuple (max-allocation u0))
+      (let
+        (
+          (contribution-ratio (/ (* (get contribution member) u100) (get total-contribution community)))
+          ;; Basic fair share = contribution percentage * total supply
+          (fair-share (/ (* contribution-ratio (get total-supply resource)) u100))
+          ;; Capped by max-per-allocation
+          (capped-allocation (min fair-share (get max-per-allocation resource)))
+        )
+        (tuple (max-allocation capped-allocation))
+      )
+    )
+  )
+)
+
+;; Check if member can allocate a resource now
+(define-read-only (can-allocate-now (community-id uint) (resource-id uint) (member-id uint) (amount uint))
+  (let
+    (
+      (resource (unwrap! (get-resource resource-id) false))
+      (member (unwrap! (get-member community-id member-id) false))
+      (usage (default-to { last-usage-block: u0, total-usage: u0, usage-count: u0, average-duration: u0, contribution-at-last-usage: u0 }
+                       (map-get? resource-usage { resource-id: resource-id, member-id: member-id })))
+    )
+    
+    (and
+      ;; Resource is active
+      (get is-active resource)
+      ;; Member is active
+      (get is-active member)
+      ;; Sufficient contribution
+      (>= (get contribution member) (get minimum-contribution resource))
+      ;; Sufficient remaining supply
+      (>= (get remaining-supply resource) amount)
+      ;; Not in cooldown period
+      (>= block-height (+ (get last-usage-block usage) (get cooldown-period resource)))
+      ;; Amount is within member's entitlement
+      (<= amount (get max-allocation (calculate-allocation-entitlement community-id resource-id member-id)))
+    )
+  )
+)
+
+;; Calculate vote weight based on member's contribution and reputation
+(define-read-only (calculate-vote-weight (community-id uint) (member-id uint))
+  (match (get-member community-id member-id)
+    member
+    (let
+      (
+        (contribution-weight (get contribution member))
+        (reputation-modifier (/ (get reputation-score member) u50)) ;; 0.5-2x modifier based on reputation
+      )
+      (/ (* contribution-weight reputation-modifier) u100)
+    )
+    u0
+  )
+)
+
+;; Public functions
+
+;; Create a new community
+(define-public (create-community 
+  (name (string-utf8 100)) 
+  (description (string-utf8 500)) 
+  (membership-type (string-utf8 20))
+  (contribution-threshold uint)
+)
+  (let
+    (
+      (community-id (var-get next-community-id))
+      (member-id (var-get next-member-id))
+    )
+    
+    ;; Create community
+    (map-set communities
+      { community-id: community-id }
+      {
+        name: name,
+        description: description,
+        founder: tx-sender,
+        creation-block: block-height,
+        membership-type: membership-type,
+        contribution-threshold: contribution-threshold,
+        active-member-count: u1, ;; Founder is first member
+        total-contribution: contribution-threshold, ;; Initial contribution from founder
+        resource-count: u0,
+        is-active: true
+      }
+    )
+    
+    ;; Add founder as admin
+    (map-set community-admins
+      { community-id: community-id, admin-principal: tx-sender }
+      { added-at: block-height }
+    )
+    
+    ;; Add founder as member
+    (map-set members
+      { community-id: community-id, member-id: member-id }
+      {
+        principal: tx-sender,
+        contribution: contribution-threshold,
+        join-block: block-height,
+        last-contribution-block: block-height,
+        allocation-count: u0,
+        reputation-score: u75, ;; Founder starts with good reputation
+        is-active: true,
+        roles: (list "founder" "admin")
+      }
+    )
