@@ -1262,5 +1262,3 @@ d resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
       (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
     )
     
-    ;; Check if resource belongs to community
-    (asserts! (is-eq (get community-i
