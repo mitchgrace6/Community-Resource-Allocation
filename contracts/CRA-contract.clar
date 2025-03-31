@@ -389,3 +389,112 @@
         roles: (list "founder" "admin")
       }
     )
+      ;; Map principal to member ID
+    (map-set principals-to-members
+      { community-id: community-id, principal: tx-sender }
+      { member-id: member-id }
+    )
+    
+    ;; Increment IDs
+    (var-set next-community-id (+ community-id u1))
+    (var-set next-member-id (+ member-id u1))
+    
+    (ok community-id)
+  )
+)
+
+;; Add a new resource to a community
+(define-public (add-resource
+  (community-id uint)
+  (name (string-utf8 100))
+  (description (string-utf8 500))
+  (resource-type uint)
+  (total-supply uint)
+  (minimum-contribution uint)
+  (max-per-allocation uint)
+  (cooldown-period uint)
+)
+  (let
+    (
+      (resource-id (var-get next-resource-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-NOT-AUTHORIZED)))
+      (member-id (get member-id member-mapping))
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Create resource
+    (map-set resources
+      { resource-id: resource-id }
+      {
+        community-id: community-id,
+        name: name,
+        description: description,
+        resource-type: resource-type,
+        total-supply: total-supply,
+        remaining-supply: total-supply,
+        minimum-contribution: minimum-contribution,
+        max-per-allocation: max-per-allocation,
+        cooldown-period: cooldown-period,
+        is-active: true,
+        created-at: block-height,
+        updated-at: block-height
+      }
+    )
+    
+    ;; Update community resource count
+    (map-set communities
+      { community-id: community-id }
+      (merge community {
+        resource-count: (+ (get resource-count community) u1)
+      })
+    )
+    
+    ;; Increment resource ID
+    (var-set next-resource-id (+ resource-id u1))
+    
+    (ok resource-id)
+  )
+)
+
+;; Join a community
+(define-public (join-community (community-id uint) (initial-contribution uint))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+      (member-id (var-get next-member-id))
+    )
+    
+    ;; Check if already a member
+    (asserts! (is-none (get-member-id community-id tx-sender)) (err ERR-ALREADY-EXISTS))
+    
+    ;; Check contribution threshold
+    (asserts! (>= initial-contribution (get contribution-threshold community)) (err ERR-INSUFFICIENT-CONTRIBUTION))
+    
+    ;; Check membership type
+    (asserts! (or
+               (is-eq (get membership-type community) "open")
+               (and 
+                 (is-eq (get membership-type community) "approval")
+                 ;; For approval type, would need additional logic for approval workflow
+                 true)
+              ) 
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Add new member
+    (map-set members
+      { community-id: community-id, member-id: member-id }
+      {
+        principal: tx-sender,
+        contribution: initial-contribution,
+        join-block: block-height,
+        last-contribution-block: block-height,
+        allocation-count: u0,
+        reputation-score: u50, ;; Default starting reputation
+        is-active: true,
+        roles: (list "member")
+      }
+    )
