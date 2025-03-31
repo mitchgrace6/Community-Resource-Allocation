@@ -498,3 +498,767 @@
         roles: (list "member")
       }
     )
+     ;; Map principal to member ID
+    (map-set principals-to-members
+      { community-id: community-id, principal: tx-sender }
+      { member-id: member-id }
+    )
+    
+    ;; Update community stats
+    (map-set communities
+      { community-id: community-id }
+      (merge community {
+        active-member-count: (+ (get active-member-count community) u1),
+        total-contribution: (+ (get total-contribution community) initial-contribution)
+      })
+    )
+    
+    ;; Increment member ID
+    (var-set next-member-id (+ member-id u1))
+    
+    (ok member-id)
+  )
+)
+
+;; Make a contribution
+(define-public (contribute (community-id uint) (amount uint))
+  (let
+    (
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Update member contribution
+    (map-set members
+      { community-id: community-id, member-id: member-id }
+      (merge member {
+        contribution: (+ (get contribution member) amount),
+        last-contribution-block: block-height
+      })
+    )
+    
+    ;; Update community total contribution
+    (map-set communities
+      { community-id: community-id }
+      (merge community {
+        total-contribution: (+ (get total-contribution community) amount)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Request resource allocation
+(define-public (request-allocation
+  (community-id uint)
+  (resource-id uint)
+  (amount uint)
+  (requested-start uint)
+  (requested-duration (optional uint))
+  (justification (string-utf8 500))
+)
+  (let
+    (
+      (request-id (var-get next-request-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if resource belongs to community
+    (asserts! (is-eq (get community-id resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Create dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      {
+        community-id: community-id,
+        resource-id: resource-id,
+        allocation-id: allocation-id,
+        raised-by: member-id,
+        raised-against: against-member-id,
+        dispute-type: dispute-type,
+        description: description,
+        status: DISPUTE-STATUS-OPEN,
+        created-at: block-height,
+        resolution: none,
+        votes-for: u0,
+        votes-against: u0,
+        resolved-at: none
+      }
+    )
+    
+    ;; Increment dispute ID
+    (var-set next-dispute-id (+ dispute-id u1))
+    
+    (ok dispute-id)
+  )
+)
+
+;; Vote on a dispute
+(define-public (vote-on-dispute (dispute-id uint) (vote bool) (justification (string-utf8 200)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err ERR-DISPUTE-NOT-FOUND)))
+      (community-id (get community-id dispute))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (vote-weight (calculate-vote-weight community-id member-id))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if dispute is open for voting
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-VOTING) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if member hasn't already voted
+    (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, member-id: member-id })) (err ERR-VOTE-ALREADY-CAST))
+    
+    ;; Record vote
+    (map-set dispute-votes
+      { dispute-id: dispute-id, member-id: member-id }
+      {
+        vote: vote,
+        justification: justification,
+        weight: vote-weight,
+        vote-time: block-height
+      }
+    )
+    
+    ;; Update vote tally
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        votes-for: (if vote 
+                     (+ (get votes-for dispute) vote-weight)
+                     (get votes-for dispute)),
+        votes-against: (if vote 
+                         (get votes-against dispute)
+                         (+ (get votes-against dispute) vote-weight))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a dispute
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-utf8 500)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) (err ERR-DISPUTE-NOT-FOUND)))
+      (community-id (get community-id dispute))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if dispute is still open or in voting
+    (asserts! (or (is-eq (get status dispute) DISPUTE-STATUS-OPEN)
+                 (is-eq (get status dispute) DISPUTE-STATUS-VOTING))
+              (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: DISPUTE-STATUS-RESOLVED,
+        resolution: (some resolution),
+        resolved-at: (some block-height)
+      })
+    )
+    
+    ;; Apply penalties or adjustments based on resolution
+    ;; This would be more complex in a full implementation
+    
+    (ok true)
+  )
+)
+;; Propose a resource expansion
+(define-public (propose-expansion
+  (community-id uint)
+  (resource-id (optional uint))
+  (name (string-utf8 100))
+  (description (string-utf8 500))
+  (resource-type uint)
+  (proposed-supply uint)
+  (estimated-cost uint)
+  (funding-source (string-utf8 100))
+)
+  (let
+    (
+      (expansion-id (var-get next-expansion-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; If expanding existing resource, check if it exists
+    (when (is-some resource-id)
+      (let
+        (
+          (resource (unwrap! (get-resource (unwrap-panic resource-id)) (err ERR-RESOURCE-NOT-FOUND)))
+        )
+        ;; Check if resource belongs to community
+        (asserts! (is-eq (get community-id resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+      )
+    )
+    
+    ;; Create expansion proposal
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      {
+        community-id: community-id,
+        resource-id: resource-id,
+        name: name,
+        description: description,
+        proposed-by: member-id,
+        resource-type: resource-type,
+        proposed-supply: proposed-supply,
+        estimated-cost: estimated-cost,
+        funding-source: funding-source,
+        status: EXPANSION-STATUS-PROPOSAL,
+        votes-for: u0,
+        votes-against: u0,
+        created-at: block-height,
+        voting-ends-at: (+ block-height u1440), ;; ~10 days (assuming 1 block/min)
+        implemented-at: none
+      }
+    )
+    
+    ;; Increment expansion ID
+    (var-set next-expansion-id (+ expansion-id u1))
+    
+    (ok expansion-id)
+  )
+)
+
+;; Start voting on expansion proposal
+(define-public (start-expansion-voting (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if proposal is in proposal state
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-PROPOSAL) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update status to voting
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        status: EXPANSION-STATUS-VOTING,
+        voting-ends-at: (+ block-height u1440) ;; ~10 days from now
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Vote on expansion proposal
+(define-public (vote-on-expansion (expansion-id uint) (vote bool))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (vote-weight (calculate-vote-weight community-id member-id))
+    )
+    
+    ;; Check if member is active
+    (asserts! (get is-active member) (err ERR-INACTIVE-MEMBER))
+    
+    ;; Check if expansion is in voting phase
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-VOTING) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if voting period hasn't ended
+    (asserts! (<= block-height (get voting-ends-at expansion)) (err ERR-VOTING-CLOSED))
+    
+    ;; Check if member hasn't already voted
+    (asserts! (is-none (map-get? expansion-votes { expansion-id: expansion-id, member-id: member-id })) (err ERR-VOTE-ALREADY-CAST))
+    
+    ;; Record vote
+    (map-set expansion-votes
+      { expansion-id: expansion-id, member-id: member-id }
+      {
+        vote: vote,
+        weight: vote-weight,
+        vote-time: block-height
+      }
+    )
+    
+    ;; Update vote tally
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        votes-for: (if vote 
+                     (+ (get votes-for expansion) vote-weight)
+                     (get votes-for expansion)),
+        votes-against: (if vote 
+                         (get votes-against expansion)
+                         (+ (get votes-against expansion) vote-weight))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Finalize expansion proposal voting
+(define-public (finalize-expansion-voting (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if expansion is in voting phase
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-VOTING) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Check if voting period has ended
+    (asserts! (> block-height (get voting-ends-at expansion)) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Determine outcome
+    (let
+      (
+        (total-votes (+ (get votes-for expansion) (get votes-against expansion)))
+        (result (if (> (get votes-for expansion) (get votes-against expansion))
+                  EXPANSION-STATUS-APPROVED
+                  EXPANSION-STATUS-DENIED))
+      )
+      
+      ;; Update expansion status
+      (map-set expansion-proposals
+        { expansion-id: expansion-id }
+        (merge expansion {
+          status: result
+        })
+      )
+      
+      (ok result)
+    )
+  )
+)
+
+;; Implement approved expansion
+(define-public (implement-expansion (expansion-id uint))
+  (let
+    (
+      (expansion (unwrap! (map-get? expansion-proposals { expansion-id: expansion-id }) (err ERR-EXPANSION-NOT-FOUND)))
+      (community-id (get community-id expansion))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if expansion is approved
+    (asserts! (is-eq (get status expansion) EXPANSION-STATUS-APPROVED) (err ERR-INVALID-PARAMETERS))
+    
+    ;; If expanding existing resource
+    (match (get resource-id expansion)
+      existing-resource-id
+      (let
+        (
+          (resource (unwrap! (get-resource existing-resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+        )
+        ;; Update resource
+        (map-set resources
+          { resource-id: existing-resource-id }
+          (merge resource {
+            total-supply: (+ (get total-supply resource) (get proposed-supply expansion)),
+            remaining-supply: (+ (get remaining-supply resource) (get proposed-supply expansion)),
+            updated-at: block-height
+          })
+        )
+      )
+      ;; Creating new resource
+      (let
+        (
+          (resource-id (var-get next-resource-id))
+          (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+        )
+        ;; Create new resource
+        (map-set resources
+          { resource-id: resource-id }
+          {
+            community-id: community-id,
+            name: (get name expansion),
+            description: (get description expansion),
+            resource-type: (get resource-type expansion),
+            total-supply: (get proposed-supply expansion),
+            remaining-supply: (get proposed-supply expansion),
+            minimum-contribution: u0, ;; Default, should be set by admin later
+            max-per-allocation: (get proposed-supply expansion), ;; Default, should be set by admin later
+            cooldown-period: u0, ;; Default, should be set by admin later
+            is-active: true,
+            created-at: block-height,
+            updated-at: block-height
+          }
+        )
+        
+        ;; Update community resource count
+        (map-set communities
+          { community-id: community-id }
+          (merge community {
+            resource-count: (+ (get resource-count community) u1)
+          })
+        )
+        
+        ;; Increment resource ID
+        (var-set next-resource-id (+ resource-id u1))
+      )
+    )
+    
+    ;; Update expansion status
+    (map-set expansion-proposals
+      { expansion-id: expansion-id }
+      (merge expansion {
+        status: EXPANSION-STATUS-IMPLEMENTED,
+        implemented-at: (some block-height)
+      })
+    )
+    
+    (ok true)
+  )
+)
+;; Make admin
+(define-public (make-admin (community-id uint) (user-principal principal))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if user is a member
+    (asserts! (is-some (get-member-id community-id user-principal)) (err ERR-MEMBER-NOT-FOUND))
+    
+    ;; Add user as admin
+    (map-set community-admins
+      { community-id: community-id, admin-principal: user-principal }
+      { added-at: block-height }
+    )
+    
+    ;; Update member roles
+    (match (get-member-id community-id user-principal)
+      member-mapping
+      (let
+        (
+          (member-id (get member-id member-mapping))
+          (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+          (current-roles (get roles member))
+        )
+        (map-set members
+          { community-id: community-id, member-id: member-id }
+          (merge member {
+            roles: (append current-roles "admin")
+          })
+        )
+      )
+      (err ERR-MEMBER-NOT-FOUND)
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update member reputation
+(define-public (update-reputation (community-id uint) (member-id uint) (score-change int))
+  (let
+    (
+      (community (unwrap! (get-community community-id) (err ERR-COMMUNITY-NOT-FOUND)))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Calculate new reputation score (bounded 0-100)
+    (let
+      (
+        (current-score (get reputation-score member))
+        (new-score (+ current-score score-change))
+        (bounded-score (max (min new-score u100) u0))
+      )
+      
+      ;; Update member
+      (map-set members
+        { community-id: community-id, member-id: member-id }
+        (merge member {
+          reputation-score: bounded-score
+        })
+      )
+      
+      (ok bounded-score)
+    )
+  )
+)
+d resource) community-id) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if resource is active
+    (asserts! (get is-active resource) (err ERR-RESOURCE-NOT-FOUND))
+    
+    ;; Check if sufficient contribution
+    (asserts! (>= (get contribution member) (get minimum-contribution resource)) (err ERR-INSUFFICIENT-CONTRIBUTION))
+    
+    ;; Check if resource has sufficient supply
+    (asserts! (>= (get remaining-supply resource) amount) (err ERR-RESOURCE-DEPLETED))
+    
+    ;; Create allocation request
+    (map-set allocation-requests
+      { request-id: request-id }
+      {
+        resource-id: resource-id,
+        community-id: community-id,
+        member-id: member-id,
+        amount: amount,
+        requested-start: requested-start,
+        requested-duration: requested-duration,
+        justification: justification,
+        created-at: block-height,
+        status: ALLOCATION-STATUS-PENDING,
+        votes-for: u0,
+        votes-against: u0
+      }
+    )
+    
+    ;; Increment request ID
+    (var-set next-request-id (+ request-id u1))
+    
+    (ok request-id)
+  )
+)
+
+;; Process allocation request (auto-approval based on entitlement)
+(define-public (process-allocation-request (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? allocation-requests { request-id: request-id }) (err ERR-REQUEST-NOT-FOUND)))
+      (resource-id (get resource-id request))
+      (community-id (get community-id request))
+      (member-id (get member-id request))
+      (amount (get amount request))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+      (entitlement (calculate-allocation-entitlement community-id resource-id member-id))
+      (allocation-id (var-get next-allocation-id))
+    )
+    
+    ;; Check if requester or admin
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+        (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+      )
+      (err ERR-NOT-AUTHORIZED)
+    )
+    
+    ;; Check if request is pending
+    (asserts! (is-eq (get status request) ALLOCATION-STATUS-PENDING) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Check entitlement
+    (asserts! (<= amount (get max-allocation entitlement)) (err ERR-ALLOCATION-LIMIT-REACHED))
+    
+    ;; Check current supply
+    (asserts! (>= (get remaining-supply resource) amount) (err ERR-RESOURCE-DEPLETED))
+    
+    ;; Create allocation
+    (map-set allocations
+      { allocation-id: allocation-id }
+      {
+        resource-id: resource-id,
+        community-id: community-id,
+        member-id: member-id,
+        amount: amount,
+        start-block: (get requested-start request),
+        end-block: (match (get requested-duration request)
+                    duration (some (+ (get requested-start request) duration))
+                    none),
+        status: ALLOCATION-STATUS-APPROVED,
+        created-at: block-height,
+        updated-at: block-height,
+        notes: "Auto-approved based on contribution entitlement"
+      }
+    )
+    
+    ;; Update resource remaining supply
+    (map-set resources
+      { resource-id: resource-id }
+      (merge resource {
+        remaining-supply: (- (get remaining-supply resource) amount),
+        updated-at: block-height
+      })
+    )
+    
+    ;; Update request status
+    (map-set allocation-requests
+      { request-id: request-id }
+      (merge request {
+        status: ALLOCATION-STATUS-APPROVED
+      })
+    )
+    
+    ;; Update member allocation count
+    (match (get-member community-id member-id)
+      member
+      (map-set members
+        { community-id: community-id, member-id: member-id }
+        (merge member {
+          allocation-count: (+ (get allocation-count member) u1)
+        })
+      )
+      (err ERR-MEMBER-NOT-FOUND)
+    )
+    
+    ;; Update usage tracking
+    (match (map-get? resource-usage { resource-id: resource-id, member-id: member-id })
+      usage
+      (map-set resource-usage
+        { resource-id: resource-id, member-id: member-id }
+        {
+          total-usage: (+ (get total-usage usage) amount),
+          last-usage-block: block-height,
+          usage-count: (+ (get usage-count usage) u1),
+          average-duration: (match (get requested-duration request)
+                            duration 
+                            (/ (+ (* (get average-duration usage) (get usage-count usage)) duration)
+                               (+ (get usage-count usage) u1))
+                            (get average-duration usage)),
+          contribution-at-last-usage: (get contribution (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+        }
+      )
+      ;; First usage
+      (map-set resource-usage
+        { resource-id: resource-id, member-id: member-id }
+        {
+          total-usage: amount,
+          last-usage-block: block-height,
+          usage-count: u1,
+          average-duration: (default-to u0 (get requested-duration request)),
+          contribution-at-last-usage: (get contribution (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+        }
+      )
+    )
+    
+    ;; Increment allocation ID
+    (var-set next-allocation-id (+ allocation-id u1))
+    
+    (ok allocation-id)
+  )
+)
+
+;; Complete a resource allocation (release the resource)
+(define-public (complete-allocation (allocation-id uint))
+  (let
+    (
+      (allocation (unwrap! (map-get? allocations { allocation-id: allocation-id }) (err ERR-ALLOCATION-NOT-FOUND)))
+      (resource-id (get resource-id allocation))
+      (community-id (get community-id allocation))
+      (member-id (get member-id allocation))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
+    ;; Check if requester or admin
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+        (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+      )
+      (err ERR-NOT-AUTHORIZED)
+    )
+    
+    ;; Check if allocation is approved
+    (asserts! (is-eq (get status allocation) ALLOCATION-STATUS-APPROVED) (err ERR-INVALID-PARAMETERS))
+    
+    ;; For time-based resources, check if end time has passed
+    (match (get end-block allocation)
+      end-time
+      (when (> end-time block-height) 
+        ;; If still in use, allow early return only for the user themselves or admin
+        (asserts! 
+          (or 
+            (is-eq tx-sender (get principal (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND))))
+            (is-some (map-get? community-admins { community-id: community-id, admin-principal: tx-sender }))
+          )
+          (err ERR-NOT-AUTHORIZED)
+        ))
+      true
+    )
+    
+    ;; Update allocation status
+    (map-set allocations
+      { allocation-id: allocation-id }
+      (merge allocation {
+        status: ALLOCATION-STATUS-COMPLETED,
+        updated-at: block-height
+      })
+    )
+    
+    ;; For unique or time-based resources, return the resource to the pool
+    (when (or (is-eq (get resource-type resource) RESOURCE-TYPE-UNIQUE)
+             (is-eq (get resource-type resource) RESOURCE-TYPE-TIME-BASED))
+      (map-set resources
+        { resource-id: resource-id }
+        (merge resource {
+          remaining-supply: (+ (get remaining-supply resource) (get amount allocation)),
+          updated-at: block-height
+        })
+      )
+    )
+    
+    ;; For consumable resources, don't return to pool
+    
+    (ok true)
+  )
+)
+
+;; Raise a dispute over resource usage
+(define-public (raise-dispute
+  (community-id uint)
+  (resource-id uint)
+  (allocation-id (optional uint))
+  (against-member-id (optional uint))
+  (dispute-type (string-utf8 50))
+  (description (string-utf8 500))
+)
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (member-mapping (unwrap! (get-member-id community-id tx-sender) (err ERR-MEMBER-NOT-FOUND)))
+      (member-id (get member-id member-mapping))
+      (member (unwrap! (get-member community-id member-id) (err ERR-MEMBER-NOT-FOUND)))
+      (resource (unwrap! (get-resource resource-id) (err ERR-RESOURCE-NOT-FOUND)))
+    )
+    
